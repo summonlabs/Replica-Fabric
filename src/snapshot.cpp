@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -431,7 +432,12 @@ std::optional<RecoveredState> decode_snapshot(const std::vector<std::uint8_t>& b
 
   std::uint64_t nw = 0; if (!body.u64(nw)) { set_err("worker count"); return std::nullopt; }
   if (nw > body.remaining()) { set_err("worker count overflow"); return std::nullopt; }
-  for (std::uint64_t i = 0; i < nw; ++i) { WorkerRegistration w; if (!read_worker(body, w)) { set_err("worker decode: " + body.error()); return std::nullopt; } state.workers.push_back(std::move(w)); }
+  std::set<WorkerId> worker_ids;
+  for (std::uint64_t i = 0; i < nw; ++i) {
+    WorkerRegistration w; if (!read_worker(body, w)) { set_err("worker decode: " + body.error()); return std::nullopt; }
+    if (!worker_ids.insert(w.worker_id).second) { set_err("duplicate worker id"); return std::nullopt; }
+    state.workers.push_back(std::move(w));
+  }
 
   std::uint64_t np = 0; if (!body.u64(np)) { set_err("promotion count"); return std::nullopt; }
   if (np > body.remaining()) { set_err("promotion count overflow"); return std::nullopt; }

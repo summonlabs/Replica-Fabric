@@ -68,6 +68,9 @@ if(RF_ENABLE_CUDA)
     set(RF_CUDA_FOUND ON)
     message(STATUS "Replica Fabric: CUDA toolkit ${CUDAToolkit_VERSION} found")
     enable_language(CUDA)
+    # The CUDA runtime is linked explicitly (CUDA::cudart). The implicit static
+    # CUDA runtime would add a second runtime that needs the static CRT.
+    set(CMAKE_CUDA_RUNTIME_LIBRARY None)
     file(GLOB_RECURSE RF_CUDA_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/*.cu")
     if(RF_CUDA_SOURCES)
       add_library(replicafabric_cuda STATIC ${RF_CUDA_SOURCES})
@@ -79,6 +82,11 @@ if(RF_ENABLE_CUDA)
         CUDA_STANDARD 17)
       if(MSVC)
         target_compile_options(replicafabric_cuda PRIVATE -Xcompiler=/W4,-WX,-wd4211)
+        if(CMAKE_GENERATOR MATCHES "Visual Studio")
+          # The Visual Studio CUDA integration appends its own host warning
+          # level after the options above; keep it at the same level.
+          set_source_files_properties(${RF_CUDA_SOURCES} PROPERTIES VS_SETTINGS "Warning=W4")
+        endif()
       else()
         target_compile_options(replicafabric_cuda PRIVATE -Xcompiler=-Wall,-Wextra,-Werror)
       endif()

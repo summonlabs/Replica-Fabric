@@ -132,4 +132,34 @@ RF_TEST_CASE(concurrency_high_contention_churn) {
   RF_CHECK_EQ(errors.load(), 0);  // no spurious serving eligibility during churn
 }
 
+// Regression: a frame cut short inside the fixed identity header is rejected
+// without reading identities from beyond the end of the frame.
+RF_TEST_CASE(adversarial_truncated_message_header_rejected) {
+  Message full;
+  full.kind = MessageKind::HEALTH;
+  full.seq = 7;
+  full.epoch = rnd<CoordinatorEpoch>(); full.worker = rnd<WorkerId>(); full.boot = rnd<WorkerBootId>();
+  full.replica = rnd<ReplicaId>(); full.set = rnd<ReplicaSetId>(); full.attempt = rnd<AttemptId>();
+  full.payload = "state=2";
+  const std::vector<std::uint8_t> bytes = encode_message(full);
+  Message back;
+  RF_CHECK(decode_message(bytes, back));
+  RF_CHECK(back.worker == full.worker && back.attempt == full.attempt && back.payload == full.payload);
+
+  const std::size_t fixed_header = 1 + 8 + 6 * 16;  // kind, sequence, six identities
+  for (std::size_t cut = 0; cut < bytes.size(); ++cut) {
+    // The storage behind the frame keeps non-zero bytes past the frame's end,
+    // as a reused receive buffer would.
+    std::vector<std::uint8_t> frame(bytes.size() + 128, 0xAB);
+    for (std::size_t i = 0; i < cut; ++i) frame[i] = bytes[i];
+    frame.resize(cut);
+    Message m;
+    RF_CHECK(!decode_message(frame, m));
+    if (cut < fixed_header) {
+      RF_CHECK(m.epoch.is_null() && m.worker.is_null() && m.boot.is_null());
+      RF_CHECK(m.replica.is_null() && m.set.is_null() && m.attempt.is_null());
+    }
+  }
+}
+
 RF_TEST_MAIN()

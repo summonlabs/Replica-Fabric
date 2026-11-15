@@ -179,3 +179,113 @@ RF_TEST_CASE(snapshot_incompatible_version_rejected) {
   RF_CHECK(!decode_snapshot(b, &err).has_value());
   RF_CHECK(err.find("incompatible") != std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests
+// ---------------------------------------------------------------------------
+#include <limits>
+#include <string>
+
+namespace {
+
+// CRC-64 of the snapshot trailer (reflected ECMA-182 polynomial, zero seed).
+std::uint64_t test_crc64(const std::vector<std::uint8_t>& data) {
+  std::uint64_t crc = 0;
+  for (const std::uint8_t byte : data) {
+    crc ^= byte;
+    for (int k = 0; k < 8; ++k) crc = (crc & 1) ? ((crc >> 1) ^ 0xC96C5795D7870F42ULL) : (crc >> 1);
+  }
+  return crc;
+}
+
+void put_u64(std::vector<std::uint8_t>& v, std::uint64_t x) {
+  for (int i = 0; i < 8; ++i) v.push_back(static_cast<std::uint8_t>((x >> (8 * i)) & 0xFF));
+}
+
+// A well-formed snapshot that holds nothing but `copies` records of one worker.
+std::vector<std::uint8_t> snapshot_with_worker_copies(std::size_t copies) {
+  ReplicaSetController ctrl(5);
+  WorkerRegistration wr;
+  wr.worker_id = WorkerId(0x11, 0x22);
+  wr.boot_id = WorkerBootId(0x33, 0x44);
+  wr.node_id = NodeId(0x55, 0x66);
+  wr.protocol_version = 1;
+  wr.inventory.devices.push_back(DeviceCapability{AcceleratorKind::CUDA, "cuda:0", {12,0}, 1024});
+  ctrl.register_worker(wr, 0, 0);
+  const std::vector<std::uint8_t> one = make_snapshot(ctrl);
+  // Layout: magic(8) format(4) schema(4) body_len(8) | body | crc(8). The body
+  // of this controller is: sets(0) replicas(0) workers(1) <worker>
+  // promotions(0) drains(0) failovers(0) epoch(16).
+  const auto at = [&](std::size_t offset) { return one.begin() + static_cast<std::ptrdiff_t>(offset); };
+  const std::size_t body_start = 24;
+  const std::size_t body_end = one.size() - 8;
+  const std::size_t worker_begin = body_start + 24;
+  const std::size_t worker_end = body_end - (24 + 16);
+  std::vector<std::uint8_t> body;
+  put_u64(body, 0);
+  put_u64(body, 0);
+  put_u64(body, copies);
+  for (std::size_t i = 0; i < copies; ++i) body.insert(body.end(), at(worker_begin), at(worker_end));
+  body.insert(body.end(), at(worker_end), at(body_end));
+  std::vector<std::uint8_t> out(at(0), at(16));
+  put_u64(out, body.size());
+  out.insert(out.end(), body.begin(), body.end());
+  put_u64(out, test_crc64(out));
+  return out;
+}
+
+}  // namespace
+
+// Duplicate worker ids are rejected like duplicate replica-set and replica ids.
+RF_TEST_CASE(snapshot_duplicate_worker_rejected) {
+  std::string err;
+  // The hand-assembled encoding is itself valid: a single record decodes.
+  const auto single = decode_snapshot(snapshot_with_worker_copies(1), &err);
+  RF_REQUIRE(single.has_value());
+  RF_CHECK_EQ(single->workers.size(), 1u);
+
+  err.clear();
+  RF_CHECK(!decode_snapshot(snapshot_with_worker_copies(2), &err).has_value());
+  RF_CHECK(err.find("duplicate worker") != std::string::npos);
+  ReplicaSetController c2(1);
+  RF_CHECK(!recover_into(snapshot_with_worker_copies(2), c2, &err));
+  RF_CHECK(c2.workers().empty());
+}
+
+// A non-finite or out-of-range value is refused where it enters the controller,
+// so a snapshot of the controller always recovers.
+RF_TEST_CASE(snapshot_recovers_after_invalid_confidence_report) {
+  ReplicaSetController ctrl(3);
+  build_controller(ctrl);
+  const ReplicaId id = ctrl.list_replicas(ctrl.list_sets()[0])[0];
+  const ReplicaState* r = ctrl.find_replica(id);
+  RF_REQUIRE(r != nullptr);
+  const WorkerId w = r->worker_id;
+  const WorkerBootId b = r->boot_id;
+  const double confidence_before = r->health_record.confidence;
+  const double invalid[] = {std::numeric_limits<double>::quiet_NaN(),
+                            std::numeric_limits<double>::infinity(), -0.5, 1.5};
+  for (const double bad : invalid) {
+    HealthEvidence he;
+    he.state = HealthState::HEALTHY;
+    he.kind = HealthEvidenceKind::REPORTED;
+    he.source = "probe";
+    he.generation = ctrl.find_replica(id)->health_generation;
+    he.confidence = bad;
+    const OpResult res = ctrl.report_health(id, he, w, b, 0);
+    RF_CHECK(res.status == OpStatus::INVALID);
+  }
+  RF_CHECK(ctrl.find_replica(id)->health_record.confidence == confidence_before);
+
+  ReplicaSetController c2(4);
+  std::string err;
+  RF_CHECK(recover_into(make_snapshot(ctrl), c2, &err));
+  RF_CHECK(err.empty());
+
+  // A replica set whose health threshold is not finite is not created.
+  ReplicaSetState s = mk_set();
+  s.policies.health.health_threshold = std::numeric_limits<double>::quiet_NaN();
+  RF_CHECK(ctrl.create_replica_set(s, ctrl.epoch()).status == OpStatus::INVALID);
+  RF_CHECK(ctrl.find_set(s.id) == nullptr);
+  RF_CHECK(recover_into(make_snapshot(ctrl), c2, &err));
+}

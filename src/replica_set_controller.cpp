@@ -4,6 +4,7 @@
 #include <replicafabric/core/compatibility.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <set>
 #include <utility>
@@ -97,6 +98,11 @@ OpResult ReplicaSetController::create_replica_set(const ReplicaSetState& set, Co
     return OpResult::invalid(
         "replica set counts invalid (desired/min_healthy/max must satisfy 0 < min <= desired <= max)");
   }
+  // Persistence rejects NaN/Inf, so a non-finite threshold would make every
+  // snapshot of this controller unrecoverable.
+  if (!std::isfinite(set.policies.health.health_threshold)) {
+    return OpResult::invalid("replica set health threshold must be finite");
+  }
   sets_[set.id] = set;
   epoch_ = epoch;
   return OpResult::ok("replica set created");
@@ -129,6 +135,37 @@ namespace {
 bool worker_boot_matches(const ReplicaState& r, const WorkerId& worker, WorkerBootId boot) {
   return r.worker_id == worker && r.boot_id == boot;
 }
+
+// Evidence and promotion requests are only accepted from the worker incarnation
+// the replica is bound to AND the coordinator currently recognizes. A report
+// from a boot identity that has since been replaced or unregistered is stale.
+bool worker_incarnation_current(const std::map<WorkerId, WorkerRegistration>& workers,
+                                const ReplicaState& r, const WorkerId& worker,
+                                WorkerBootId boot) {
+  if (!worker_boot_matches(r, worker, boot)) return false;
+  const auto it = workers.find(worker);
+  return it != workers.end() && it->second.boot_id == boot;
+}
+
+// A replica is operationally warm only when every step its set's warming policy
+// requires is complete.
+bool warming_complete(const WarmingPolicy& p, const WarmingRecord& w) {
+  if (!p.enabled) return true;
+  if (p.require_artifact_loaded && !w.artifact_loading_done) return false;
+  if (p.require_weights_resident && !w.weights_resident) return false;
+  if (p.require_adapters_active && !w.adapters_active) return false;
+  if (p.require_kernel_init && !w.kernel_init_done) return false;
+  if (p.require_graph_init && !w.graph_init_done) return false;
+  if (p.require_allocator_init && !w.allocator_init_done) return false;
+  if (p.require_device_context && !w.device_context_done) return false;
+  if (p.require_endpoint && !w.endpoint_registered) return false;
+  if (p.require_bounded_warmup &&
+      (!w.warmup_execution_done || w.steps_completed < w.steps_required ||
+       w.steps_completed < p.warmup_work_steps)) {
+    return false;
+  }
+  return true;
+}
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -149,10 +186,21 @@ OpResult ReplicaSetController::provision_replica(ReplicaId replica_id, ReplicaSe
   if (wit == workers_.end()) return OpResult::rejected("unknown worker");
   const auto& reg = wit->second;
 
+  // A new incarnation may only replace one that has failed or retired; a live
+  // replica (and any serving authority it holds) is never silently replaced.
+  const auto existing = replicas_.find(replica_id);
+  if (existing != replicas_.end() && existing->second.lifecycle != ReplicaLifecycle::FAILED &&
+      existing->second.lifecycle != ReplicaLifecycle::RETIRED) {
+    return OpResult::rejected("replica already exists");
+  }
+
+  // max_replicas bounds the set's members: retired replicas and the incarnation
+  // being replaced do not occupy a slot.
   std::uint32_t count = 0;
   for (const auto& [rid, r] : replicas_) {
-    if (r.set_id == set_id) ++count;
-    (void)rid;
+    if (r.set_id == set_id && rid != replica_id && r.lifecycle != ReplicaLifecycle::RETIRED) {
+      ++count;
+    }
   }
   if (count >= set.max_replicas) {
     return OpResult::rejected("replica set max_replicas reached");
@@ -240,21 +288,20 @@ OpResult ReplicaSetController::warm_replica(ReplicaId replica_id, const WarmingR
   auto it = replicas_.find(replica_id);
   if (it == replicas_.end()) return OpResult::rejected("unknown replica");
   auto& r = it->second;
-  if (!worker_boot_matches(r, worker, boot)) {
+  if (!worker_incarnation_current(workers_, r, worker, boot)) {
     return OpResult::rejected("stale worker boot identity");
   }
+  const auto sit = sets_.find(r.set_id);
+  if (sit == sets_.end()) return OpResult::rejected("unknown replica set");
   if (!can_transition(r.lifecycle, ReplicaLifecycle::WARMING) &&
       r.lifecycle != ReplicaLifecycle::WARMING) {
     return OpResult::invalid("replica is not in a state that accepts warming");
   }
   r.lifecycle = ReplicaLifecycle::WARMING;
   r.warming_record = warm;
-  if (!warm.warmup_execution_done && warm.steps_required > 0 && warm.steps_completed > 0) {
-    r.warmth = WarmthState::WARMING;
-  } else {
-    // Full warm set under policy => WARM.
-    r.warmth = WarmthState::WARM;
-  }
+  // Full warm set under policy => WARM; anything less is still warming.
+  r.warmth = warming_complete(sit->second.policies.warming, warm) ? WarmthState::WARM
+                                                                  : WarmthState::WARMING;
   if (!r.warming_record.started_warming_mono) r.warming_record.started_warming_mono = mono;
   return OpResult::ok("replica warming progressed");
 }
@@ -264,7 +311,7 @@ OpResult ReplicaSetController::report_health(ReplicaId replica_id, const HealthE
   auto it = replicas_.find(replica_id);
   if (it == replicas_.end()) return OpResult::rejected("unknown replica");
   auto& r = it->second;
-  if (!worker_boot_matches(r, worker, boot)) {
+  if (!worker_incarnation_current(workers_, r, worker, boot)) {
     return OpResult::rejected("stale worker boot identity");
   }
   if (r.coordinator_epoch != epoch_) {
@@ -278,6 +325,11 @@ OpResult ReplicaSetController::report_health(ReplicaId replica_id, const HealthE
   if (r.lifecycle == ReplicaLifecycle::FAILED || r.lifecycle == ReplicaLifecycle::RETIRED ||
       r.lifecycle == ReplicaLifecycle::QUIESCED) {
     return OpResult::rejected("replica is terminated; health evidence rejected");
+  }
+  // Confidence is a probability. A NaN/Inf value would also be stored in the
+  // health record and make the next snapshot unrecoverable.
+  if (!(ev.confidence >= 0.0 && ev.confidence <= 1.0)) {
+    return OpResult::invalid("health evidence confidence must be within [0, 1]");
   }
   r.health = ev.state;
   r.health_record.state = ev.state;
@@ -311,7 +363,7 @@ OpResult ReplicaSetController::report_readiness(ReplicaId replica_id, const Read
   auto it = replicas_.find(replica_id);
   if (it == replicas_.end()) return OpResult::rejected("unknown replica");
   auto& r = it->second;
-  if (!worker_boot_matches(r, worker, boot)) {
+  if (!worker_incarnation_current(workers_, r, worker, boot)) {
     return OpResult::rejected("stale worker boot identity");
   }
   if (r.coordinator_epoch != epoch_) {
@@ -351,7 +403,7 @@ OpResult ReplicaSetController::promote_replica(ReplicaId replica_id, PromotionSt
   auto it = replicas_.find(replica_id);
   if (it == replicas_.end()) return OpResult::rejected("unknown replica");
   auto& r = it->second;
-  if (!worker_boot_matches(r, worker, boot)) {
+  if (!worker_incarnation_current(workers_, r, worker, boot)) {
     return OpResult::rejected("stale worker boot identity");
   }
   auto sit = sets_.find(r.set_id);
@@ -377,7 +429,10 @@ OpResult ReplicaSetController::promote_replica(ReplicaId replica_id, PromotionSt
   if (pol.require_healthy && (r.health == HealthState::UNKNOWN || r.health == HealthState::STARTING)) {
     return OpResult::rejected("replica has no validated health");
   }
-  if (pol.require_healthy && r.health == HealthState::UNHEALTHY) {
+  // Only a replica that is working (HEALTHY or DEGRADED, as the serving gate
+  // requires) may be promoted; UNHEALTHY, FAILED and QUARANTINED are not.
+  if (pol.require_healthy && r.health != HealthState::HEALTHY &&
+      r.health != HealthState::DEGRADED) {
     return OpResult::rejected("replica is unhealthy");
   }
   if (pol.require_compatible) {
@@ -404,6 +459,14 @@ OpResult ReplicaSetController::promote_replica(ReplicaId replica_id, PromotionSt
   const PromotionState from = r.promotion;
   if (target == PromotionState::PRIMARY) {
     if (!ready_to_promote(r)) return OpResult::rejected("cannot promote a non-ready replica to PRIMARY");
+    // Exactly one primary holds serving authority per replica set. The current
+    // primary must be drained, failed or failed over before another is promoted.
+    for (const auto& [other_id, other] : replicas_) {
+      if (other_id != replica_id && other.set_id == r.set_id &&
+          other.promotion == PromotionState::PRIMARY && other.serving_eligible) {
+        return OpResult::rejected("replica set already has a serving primary");
+      }
+    }
     if (r.lifecycle != ReplicaLifecycle::SERVING) {
       if (!can_transition(r.lifecycle, ReplicaLifecycle::SERVING)) {
         return OpResult::invalid("cannot move replica to SERVING");
@@ -437,7 +500,8 @@ OpResult ReplicaSetController::promote_replica(ReplicaId replica_id, PromotionSt
   rec.reason = "promoted to " + std::string(to_string(target));
   promotions_.push_back(std::move(rec));
 
-  // Derive replica-set lifecycle from healthy count.
+  // Derive replica-set lifecycle from healthy count. A draining set is only
+  // re-armed by an explicit transition, never as a side effect of a promotion.
   std::uint32_t healthy = 0;
   for (const auto& [rid2, r2] : replicas_) {
     if (r2.set_id == set.id && r2.health == HealthState::HEALTHY) ++healthy;
@@ -445,7 +509,7 @@ OpResult ReplicaSetController::promote_replica(ReplicaId replica_id, PromotionSt
   }
   if (healthy < set.min_healthy && can_transition(set.lifecycle, ReplicaSetLifecycle::DEGRADED)) {
     set.lifecycle = ReplicaSetLifecycle::DEGRADED;
-  } else if (healthy >= set.min_healthy &&
+  } else if (healthy >= set.min_healthy && set.lifecycle != ReplicaSetLifecycle::DRAINING &&
              can_transition(set.lifecycle, ReplicaSetLifecycle::AVAILABLE)) {
     set.lifecycle = ReplicaSetLifecycle::AVAILABLE;
   }
@@ -494,6 +558,13 @@ OpResult ReplicaSetController::complete_drain(ReplicaId replica_id, std::uint64_
   if (!force_cancelled && r.active_requests != 0) {
     return OpResult::rejected("replica still has active requests; drain not complete");
   }
+  // Active work is force-cancelled only under explicit draining policy.
+  if (force_cancelled && r.active_requests != 0) {
+    const auto sit = sets_.find(r.set_id);
+    if (sit == sets_.end() || !sit->second.policies.draining.allow_force_cancel) {
+      return OpResult::rejected("draining policy does not allow force cancellation");
+    }
+  }
   if (!can_transition(r.lifecycle, ReplicaLifecycle::QUIESCED)) {
     return OpResult::invalid("cannot move replica to QUIESCED");
   }
@@ -521,6 +592,10 @@ OpResult ReplicaSetController::fail_replica(ReplicaId replica_id, const WorkerId
   auto& r = it->second;
   // A stale worker (old boot) must not be able to fail a fresh replica.
   if (!worker_boot_matches(r, worker, boot)) return OpResult::rejected("stale worker boot identity");
+  // A rejected request must leave the replica (e.g. a retired one) untouched.
+  if (!can_transition(r.lifecycle, ReplicaLifecycle::FAILED)) {
+    return OpResult::rejected("replica is already in a terminal/older state");
+  }
   r.serving_eligible = false;
   r.health = HealthState::FAILED;
   r.health_record.state = HealthState::FAILED;
@@ -529,9 +604,6 @@ OpResult ReplicaSetController::fail_replica(ReplicaId replica_id, const WorkerId
   r.promotion = PromotionState::NOT_PROMOTED;
   r.role = ReplicaRole::NONE;
   r.reserved_capacity = 0;
-  if (!can_transition(r.lifecycle, ReplicaLifecycle::FAILED)) {
-    return OpResult::rejected("replica is already in a terminal/older state");
-  }
   r.lifecycle = ReplicaLifecycle::FAILED;
   return OpResult::ok("replica failed and its authority is obsolete");
 }
@@ -582,9 +654,25 @@ OpResult ReplicaSetController::trigger_failover(ReplicaSetId set_id, ReplicaId f
   }
 
   const FailoverPolicy& pol = set.policies.failover;
+
+  // Exactly one primary holds serving authority per replica set. If another
+  // replica is still the serving primary, the failed replica had no serving
+  // authority to hand over: that primary is retained and nothing is promoted.
+  bool retained = false;
+  ReplicaId retained_primary;
+  for (const auto& [rid, r] : replicas_) {
+    if (r.set_id == set_id && rid != failed_replica &&
+        r.promotion == PromotionState::PRIMARY && r.serving_eligible) {
+      retained = true;
+      retained_primary = rid;
+      break;
+    }
+  }
+
   // Gather eligible candidates deterministically.
   std::vector<ReplicaId> candidates;
   for (const auto& [rid, r] : replicas_) {
+    if (retained) break;
     if (r.set_id != set_id || rid == failed_replica) continue;
     if (!(r.lifecycle == ReplicaLifecycle::READY || r.lifecycle == ReplicaLifecycle::SERVING)) continue;
     if (r.readiness != ReadinessState::READY) continue;
@@ -592,6 +680,13 @@ OpResult ReplicaSetController::trigger_failover(ReplicaSetId set_id, ReplicaId f
     if (!check_compatibility(set.compatibility, r.compatibility).compatible) continue;  // incompatible
     if (r.placement != PlacementState::ASSIGNED) continue;
     if (r.set_generation != set.generation) continue;
+    // The replacement must be able to serve once promoted: hosted by the worker
+    // incarnation currently registered, under current epoch, policy and artifact.
+    const auto wit = workers_.find(r.worker_id);
+    if (wit == workers_.end() || wit->second.boot_id != r.boot_id) continue;
+    if (r.coordinator_epoch != epoch_) continue;
+    if (r.policy_generation != set.policy_generation) continue;
+    if (r.artifact_generation != set.artifact_generation) continue;
     candidates.push_back(rid);
   }
 
@@ -618,7 +713,7 @@ OpResult ReplicaSetController::trigger_failover(ReplicaSetId set_id, ReplicaId f
     return a < b;  // deterministic tie-break by id
   });
 
-  if (candidates.empty()) {
+  if (candidates.empty() && !retained) {
     FailoverRecord f;
     f.id = random_id<FailoverId>();
     f.set_id = set_id;
@@ -634,16 +729,19 @@ OpResult ReplicaSetController::trigger_failover(ReplicaSetId set_id, ReplicaId f
     return OpResult::rejected("no eligible replacement for failover");
   }
 
-  const ReplicaId chosen = candidates.front();
+  const ReplicaId chosen = retained ? retained_primary : candidates.front();
   auto& r = replicas_.at(chosen);
-  if (r.lifecycle != ReplicaLifecycle::SERVING) {
-    r.lifecycle = ReplicaLifecycle::SERVING;
+  const PromotionState promoted_from = r.promotion;
+  if (!retained) {
+    if (r.lifecycle != ReplicaLifecycle::SERVING) {
+      r.lifecycle = ReplicaLifecycle::SERVING;
+    }
+    r.promotion = PromotionState::PRIMARY;
+    r.role = ReplicaRole::PRIMARY;
+    r.serving_eligible = true;
+    r.health_generation = random_id<HealthGeneration>();
+    r.health_record.generation = r.health_generation;
   }
-  r.promotion = PromotionState::PRIMARY;
-  r.role = ReplicaRole::PRIMARY;
-  r.serving_eligible = true;
-  r.health_generation = random_id<HealthGeneration>();
-  r.health_record.generation = r.health_generation;
 
   FailoverRecord f;
   f.id = random_id<FailoverId>();
@@ -656,24 +754,28 @@ OpResult ReplicaSetController::trigger_failover(ReplicaSetId set_id, ReplicaId f
   f.completed_mono = mono;
   f.generation_preserved = pol.preserve_generation;
   if (fr.active_requests > 0) f.ambiguous_outcomes.push_back(WorkOutcome::AMBIGUOUS);
-  f.reason = reason + "; promoted " + chosen.str();
+  f.reason = reason + (retained ? "; primary " + chosen.str() + " retained"
+                                : "; promoted " + chosen.str());
   failovers_.push_back(std::move(f));
 
-  PromotionRecord pr;
-  pr.id = random_id<PromotionId>();
-  pr.replica_id = chosen;
-  pr.set_id = set_id;
-  pr.replica_generation = r.generation;
-  pr.set_generation = r.set_generation;
-  pr.epoch = epoch_;
-  pr.from = PromotionState::STANDBY;
-  pr.to = PromotionState::PRIMARY;
-  pr.when_mono = mono;
-  pr.when_wall = wall;
-  pr.reason = "failover replacement";
-  promotions_.push_back(std::move(pr));
+  if (!retained) {
+    PromotionRecord pr;
+    pr.id = random_id<PromotionId>();
+    pr.replica_id = chosen;
+    pr.set_id = set_id;
+    pr.replica_generation = r.generation;
+    pr.set_generation = r.set_generation;
+    pr.epoch = epoch_;
+    pr.from = promoted_from;
+    pr.to = PromotionState::PRIMARY;
+    pr.when_mono = mono;
+    pr.when_wall = wall;
+    pr.reason = "failover replacement";
+    promotions_.push_back(std::move(pr));
+  }
 
-  // Update set lifecycle if below minimum healthy.
+  // Update set lifecycle if below minimum healthy. A draining set is only
+  // re-armed by an explicit transition, never as a side effect of a failover.
   std::uint32_t healthy = 0;
   for (const auto& [rid, r2] : replicas_) {
     if (r2.set_id == set_id && (r2.health == HealthState::HEALTHY)) ++healthy;
@@ -681,12 +783,13 @@ OpResult ReplicaSetController::trigger_failover(ReplicaSetId set_id, ReplicaId f
   }
   if (healthy < set.min_healthy && can_transition(set.lifecycle, ReplicaSetLifecycle::DEGRADED)) {
     set.lifecycle = ReplicaSetLifecycle::DEGRADED;
-  } else if (healthy >= set.min_healthy &&
+  } else if (healthy >= set.min_healthy && set.lifecycle != ReplicaSetLifecycle::DRAINING &&
              can_transition(set.lifecycle, ReplicaSetLifecycle::AVAILABLE)) {
     set.lifecycle = ReplicaSetLifecycle::AVAILABLE;
   }
 
-  return OpResult::ok("failover completed; promoted " + chosen.str());
+  return OpResult::ok(retained ? "failover completed; primary " + chosen.str() + " retained"
+                               : "failover completed; promoted " + chosen.str());
 }
 
 const ReplicaState* ReplicaSetController::find_replica(ReplicaId replica_id) const {

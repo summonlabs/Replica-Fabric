@@ -47,6 +47,8 @@ bool decode_message(const std::vector<std::uint8_t>& bytes, Message& out) {
   std::uint64_t seq = 0;
   if (!read_u64(bytes.data(), bytes.size(), pos, seq)) return false;
   out.seq = seq;
+  // The six fixed identities must be present before they are read.
+  if (bytes.size() - pos < 6 * 16) return false;
   read_id(bytes.data() + pos, out.epoch); pos += 16;
   read_id(bytes.data() + pos, out.worker); pos += 16;
   read_id(bytes.data() + pos, out.boot); pos += 16;
